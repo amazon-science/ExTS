@@ -1,0 +1,562 @@
+diff --git a/src/treequest/__init__.py b/src/treequest/__init__.py
+index 52bcd9f..ae27a2f 100644
+--- a/src/treequest/__init__.py
++++ b/src/treequest/__init__.py
+@@ -24,6 +24,7 @@ else:
+ 
+ from .algos.ab_mcts_a.algo import ABMCTSA
+ from .algos.base import Algorithm
++from .algos.exts import ExTS
+ from .algos.standard_mcts import StandardMCTS
+ from .algos.tree_of_thought_bfs import TreeOfThoughtsBFSAlgo
+ from .ranker import top_k
+@@ -35,6 +36,7 @@ __all__ = [
+     "TreeOfThoughtsBFSAlgo",
+     "ABMCTSA",
+     "ABMCTSM",
++    "ExTS",
+     "Algorithm",
+     "render",
+ ]
+diff --git a/src/treequest/algos/exts.py b/src/treequest/algos/exts.py
+new file mode 100644
+index 0000000..2f11c86
+--- /dev/null
++++ b/src/treequest/algos/exts.py
+@@ -0,0 +1,414 @@
++"""ExTS (Exploit More, Explore Smarter for Budget-Constrained Agentic Search) as a TreeQuest ``Algorithm``.
++
++ExTS is a Monte-Carlo-Tree-Search variant designed for *validation-heavy*
++iterative search: settings where each expansion is expensive (an LLM call, a
++compilation, a full validation-set evaluation) and where the signal from an
++expansion is a noisy scalar reward that must be compared across a growing
++population of candidates.
++
++Node value combines an exploitation term and an exploration term::
++
++    score(v) = (n_v+ / n_v) ** alpha * mean_i( phi(norm(r_i)) )  +  exploration(v)
++
++    UCT exploration:  C * sqrt( ln(n_parent) / n_v )
++    PUCT exploration: C * n_parent ** p / (1 + n_v)
++
++Every stored raw reward is *individually* min-max normalized against the tree's
++current global ``[score_min, score_max]`` range, passed through the convex
++temperature-shaping function ``phi``, then averaged. Normalizing lazily at
++selection time means the whole tree re-normalizes automatically as new global
++extremes arrive.
++
++Selection descends from the root. At each internal node the best real child is
++compared against a *virtual child* that models "what a fresh, not-yet-created
++child would look like"; if the virtual child wins and expansion is permitted,
++selection stops and the current node is returned for expansion. This is the
++adaptive-branching mechanism: the decision to widen (new sibling) or deepen
++(refine an existing child) is made by letting the virtual child compete in the
++same argmax. Gated expansion and gated progressive widening control *whether*
++and *how wide* a node may grow.
++
++TreeQuest integration notes:
++
++* The algorithm is stateless; all mutable state lives in :class:`ExTSState`,
++  which is threaded through ``step``/``ask``/``tell`` and returned.
++* Rewards are the ``score`` returned by ``generate_fn`` (in ``[0, 1]``).
++* **A ``score`` of exactly ``0.0`` is treated as a failed expansion**: the node
++  is still added to the tree, but backpropagation only increments visit counts
++  along the ancestor chain (no success, no reward recorded), which drives the
++  success-rate scaler ``(n_v+ / n_v) ** alpha`` downward for branches that keep
++  failing. Any ``score > 0.0`` is a success.
++
++See the canonical ``exts.py`` / ``docs/algorithm.md`` in the ExTS project for
++the full derivation and per-dataset hyperparameter guidance.
++"""
++
++import copy
++import math
++import random
++from collections.abc import Mapping
++from dataclasses import dataclass, field
++from typing import Dict, Generic, List, Optional, TypeVar
++
++from treequest.algos.base import Algorithm
++from treequest.algos.tree import Node, Tree
++from treequest.trial import Trial, TrialStore
++from treequest.types import GenerateFnType, StateScoreType, TrialId
++
++StateT = TypeVar("StateT")
++
++
++@dataclass
++class ExTSState(Generic[StateT]):
++    """Mutable search state for :class:`ExTS`.
++
++    Statistics are keyed by ``Node.expand_idx`` (the root has ``expand_idx == -1``).
++    """
++
++    tree: Tree[StateT]
++    visit_counts: Dict[int, int] = field(default_factory=dict)
++    successful_visits: Dict[int, int] = field(default_factory=dict)
++    reward_histories: Dict[int, List[float]] = field(default_factory=dict)
++    score_min: float = float("inf")
++    score_max: float = float("-inf")
++    trial_store: TrialStore[StateT] = field(default_factory=TrialStore)
++
++
++class ExTS(Algorithm[StateT, ExTSState[StateT]]):
++    """MCTS with per-observation exponential reward shaping, alpha-powered
++    success rates, PUCT/UCT exploration, gated expansion, gated progressive
++    widening, and a bootstrap-style virtual child.
++
++    Parameters:
++        exploration_type: ``"puct"`` (default) or ``"uct"``.
++        exploration_constant: Exploration weight ``C``. Defaults to ``1.0`` for
++            PUCT and ``1.414`` for UCT.
++        score_temperature: Convexity of the shaping function ``phi`` (lower is
++            sharper); ``<= 0`` degenerates to the identity.
++        success_rate_alpha: Exponent on ``(n_v+ / n_v)``. ``0`` ignores failures,
++            ``1`` is linear, ``> 1`` amplifies the penalty.
++        max_children: Base branching factor ``M_0``.
++        expansion_gate_quantile: Score quantile a non-root node must reach to be
++            eligible for expansion.
++        use_gated_expansion: Enable expansion gating.
++        use_progressive_widening: Enable gated progressive widening.
++        widening_base: Log base for the progressive-widening bonus.
++        widening_visit_threshold: Visits before widening starts.
++        widening_score_quantile: Score quantile gate for the widening bonus.
++        puct_parent_exp: Exponent ``p`` on ``n_parent`` for PUCT.
++        seed: Optional RNG seed for reproducible tie-breaking / sampling.
++    """
++
++    def __init__(
++        self,
++        *,
++        exploration_type: str = "puct",
++        exploration_constant: Optional[float] = None,
++        score_temperature: float = 0.3,
++        success_rate_alpha: float = 1.414,
++        max_children: int = 3,
++        expansion_gate_quantile: float = 0.25,
++        use_gated_expansion: bool = True,
++        use_progressive_widening: bool = True,
++        widening_base: float = 2.0,
++        widening_visit_threshold: int = 32,
++        widening_score_quantile: float = 0.75,
++        puct_parent_exp: float = 0.5,
++        seed: Optional[int] = None,
++    ):
++        self.exploration_type = exploration_type
++        if exploration_constant is None:
++            self.exploration_constant = 1.0 if exploration_type == "puct" else 1.414
++        else:
++            self.exploration_constant = exploration_constant
++        self.score_temperature = score_temperature
++        self.success_rate_alpha = success_rate_alpha
++        self.max_children = max_children
++        self.expansion_gate_quantile = expansion_gate_quantile
++        self.use_gated_expansion = use_gated_expansion
++        self.use_progressive_widening = use_progressive_widening
++        self.widening_base = widening_base
++        self.widening_visit_threshold = widening_visit_threshold
++        self.widening_score_quantile = widening_score_quantile
++        self.puct_parent_exp = puct_parent_exp
++        self._rng = random.Random(seed)
++
++    def init_tree(self) -> ExTSState[StateT]:
++        return ExTSState(tree=Tree.with_root_node())
++
++    def step(
++        self,
++        state: ExTSState[StateT],
++        generate_fn: Mapping[str, GenerateFnType[StateT]],
++        inplace: bool = False,
++    ) -> ExTSState[StateT]:
++        if not inplace:
++            state = copy.deepcopy(state)
++
++        state, trial = self.ask(state, actions=list(generate_fn.keys()))
++        action = trial.action
++        node = state.tree.get_node(trial.node_to_expand)
++        result = generate_fn[action](node.state)
++        state = self.tell(state, trial.trial_id, result)
++        return state
++
++    def ask_batch(
++        self, state: ExTSState[StateT], batch_size: int, actions: list[str]
++    ) -> tuple[ExTSState[StateT], list[Trial[StateT]]]:
++        trials: list[Trial[StateT]] = []
++        for _ in range(batch_size):
++            node = self._select(state)
++            action = actions[0]
++            trials.append(state.trial_store.create_trial(node, action))
++        return state, trials
++
++    def tell(
++        self, state: ExTSState[StateT], trial_id: TrialId, result: tuple[StateT, float]
++    ) -> ExTSState[StateT]:
++        _new_state, new_score = result
++
++        finished_trial = state.trial_store.get_finished_trial(trial_id, new_score)
++        if finished_trial is None:
++            return state
++
++        parent_node = state.tree.get_node(finished_trial.node_to_expand)
++        new_node = state.tree.add_node(
++            result, parent_node, trial_id=finished_trial.trial_id
++        )
++
++        # Convention: a score of exactly 0.0 is a failed expansion.
++        if new_score > 0.0:
++            self._backpropagate_success(state, new_node, new_score)
++        else:
++            self._backpropagate_failure(state, new_node)
++
++        return state
++
++    def get_state_score_pairs(
++        self, state: ExTSState[StateT]
++    ) -> List[StateScoreType[StateT]]:
++        return state.tree.get_state_score_pairs()
++
++    # -- Shaping ---------------------------------------------------------------
++
++    def _phi(self, x: float) -> float:
++        """phi(x) = (e^(x/T) - 1) / (e^(1/T) - 1), for x in [0, 1]."""
++        T = self.score_temperature
++        if T <= 0:
++            return x
++        exp_inv_T = math.exp(1.0 / T)
++        return (math.exp(x / T) - 1.0) / (exp_inv_T - 1.0)
++
++    def _shaped_mean(self, state: ExTSState[StateT], expand_idx: int) -> float:
++        """Mean of individually phi-shaped, min-max-normalized rewards."""
++        history = state.reward_histories.get(expand_idx)
++        if not history:
++            return 0.0
++        if state.score_max <= state.score_min:
++            return 1.0
++        total = 0.0
++        for r in history:
++            x = (r - state.score_min) / (state.score_max - state.score_min)
++            x = max(0.0, min(1.0, x))
++            total += self._phi(x)
++        return total / len(history)
++
++    # -- Exploration -----------------------------------------------------------
++
++    def _exploration_term(self, parent_visits: int, node_visits: float) -> float:
++        if self.exploration_type == "puct":
++            return (
++                self.exploration_constant
++                * (parent_visits ** self.puct_parent_exp)
++                / (1 + node_visits)
++            )
++        return self.exploration_constant * math.sqrt(
++            math.log(parent_visits) / node_visits
++        )
++
++    # -- UCT scoring -----------------------------------------------------------
++
++    def _uct_value(self, state: ExTSState[StateT], node: Node[StateT]) -> float:
++        visits = state.visit_counts.get(node.expand_idx, 0)
++        if visits == 0:
++            return float("inf")
++
++        parent = node.parent
++        parent_visits = (
++            max(1, state.visit_counts.get(parent.expand_idx, 1)) if parent else 1
++        )
++
++        succ = state.successful_visits.get(node.expand_idx, 0)
++
++        if succ > 0 and state.score_max > state.score_min:
++            shaped = self._shaped_mean(state, node.expand_idx)
++            success_rate = succ / visits
++            exploitation = (success_rate ** self.success_rate_alpha) * shaped
++        elif succ > 0:
++            success_rate = succ / visits
++            exploitation = success_rate ** self.success_rate_alpha
++        else:
++            exploitation = 0.0
++
++        exploration = self._exploration_term(parent_visits, visits)
++        return exploitation + exploration
++
++    def _virtual_child_uct(self, state: ExTSState[StateT], node: Node[StateT]) -> float:
++        """Virtual child UCT modeling a subtree with ``n_fair`` visits.
++
++        Samples ``k = round(n_fair * success_rate)`` scores, with replacement,
++        from the parent's reward pool (reward history plus the node's own score)
++        to estimate what a young subtree would look like. Sampling with
++        replacement preserves bootstrap-style stochasticity at small pool sizes.
++        """
++        parent_visits = max(1, state.visit_counts.get(node.expand_idx, 0))
++        m = len(node.children)
++
++        # n_fair is the average visit count among existing children, so the
++        # virtual child's exploration term is comparable to a real child at the
++        # same maturity level (dividing by m rather than m + 1 avoids deflating
++        # the baseline and over-biasing toward expansion).
++        children_visits = sum(state.visit_counts.get(c.expand_idx, 0) for c in node.children)
++        n_fair = max(1, children_visits / m)
++
++        q_prior = 0.0
++        history = state.reward_histories.get(node.expand_idx)
++        if history and state.score_max > state.score_min:
++            visits = state.visit_counts.get(node.expand_idx, 0)
++            succ = state.successful_visits.get(node.expand_idx, 0)
++            success_rate = succ / visits if visits > 0 else 1.0
++            k = max(1, round(n_fair * success_rate))
++
++            # Include the node's own score in the sampling pool so a child
++            # inherits some of the parent's tracked static quality; its weight is
++            # 1 / (len(history) + 1), which decays as more rewards accumulate.
++            pool = list(history)
++            if not node.is_root() and node.score is not None and node.score >= 0:
++                pool.append(node.score)
++
++            samples = self._rng.choices(pool, k=k)
++            total = 0.0
++            for r in samples:
++                x = (r - state.score_min) / (state.score_max - state.score_min)
++                x = max(0.0, min(1.0, x))
++                total += self._phi(x)
++            sampled_mean = total / k
++            q_prior = (success_rate ** self.success_rate_alpha) * sampled_mean
++
++        # Degenerate-range fallback: when all scores are identical, mirror the
++        # real-child exploitation term so the virtual-vs-real comparison stays
++        # fair and expansion is not blocked.
++        elif (
++            state.successful_visits.get(node.expand_idx, 0) > 0
++            and state.visit_counts.get(node.expand_idx, 0) > 0
++        ):
++            visits = state.visit_counts[node.expand_idx]
++            succ = state.successful_visits[node.expand_idx]
++            success_rate = succ / visits
++            q_prior = success_rate ** self.success_rate_alpha
++
++        return q_prior + self._exploration_term(parent_visits, n_fair)
++
++    # -- Selection -------------------------------------------------------------
++
++    def _select(self, state: ExTSState[StateT]) -> Node[StateT]:
++        root = state.tree.root
++        if not root.children:
++            return root
++        return self._uct_select(state, root)
++
++    def _uct_select(self, state: ExTSState[StateT], node: Node[StateT]) -> Node[StateT]:
++        if not node.children:
++            return node
++
++        can_expand = self._can_expand(state, node)
++
++        # Random tie-break: all unvisited children share UCT = +inf; without it
++        # max() would always return the first-added child and starve its siblings.
++        best_child = max(
++            node.children, key=lambda c: (self._uct_value(state, c), self._rng.random())
++        )
++        best_child_uct = self._uct_value(state, best_child)
++
++        if can_expand:
++            virtual_uct = self._virtual_child_uct(state, node)
++            if virtual_uct > best_child_uct:
++                return node
++
++        return self._uct_select(state, best_child)
++
++    def _can_expand(self, state: ExTSState[StateT], node: Node[StateT]) -> bool:
++        if len(node.children) >= self._max_children_for_node(state, node):
++            return False
++
++        if not self.use_gated_expansion or node is state.tree.root:
++            return True
++
++        q_alpha = self._compute_score_quantile(state, self.expansion_gate_quantile)
++        if q_alpha is None:
++            return True
++
++        if node.score is None or node.score < 0:
++            return False
++
++        return node.score >= q_alpha
++
++    def _max_children_for_node(self, state: ExTSState[StateT], node: Node[StateT]) -> int:
++        if not self.use_progressive_widening:
++            return self.max_children
++
++        n_v = state.visit_counts.get(node.expand_idx, 0)
++        if n_v < self.widening_visit_threshold:
++            return self.max_children
++
++        bonus = int(
++            math.log(n_v / self.widening_visit_threshold) / math.log(self.widening_base)
++        )
++
++        if node is state.tree.root:
++            return self.max_children + bonus
++
++        q_gamma = self._compute_score_quantile(state, self.widening_score_quantile)
++        if q_gamma is not None and node.score is not None and node.score >= q_gamma:
++            return self.max_children + bonus
++
++        return self.max_children
++
++    # -- Backpropagation -------------------------------------------------------
++
++    def _backpropagate_success(
++        self, state: ExTSState[StateT], node: Node[StateT], score: float
++    ) -> None:
++        state.score_min = min(state.score_min, score)
++        state.score_max = max(state.score_max, score)
++
++        current: Optional[Node[StateT]] = node
++        while current is not None:
++            idx = current.expand_idx
++            state.visit_counts[idx] = state.visit_counts.get(idx, 0) + 1
++            state.successful_visits[idx] = state.successful_visits.get(idx, 0) + 1
++            if idx not in state.reward_histories:
++                state.reward_histories[idx] = []
++            state.reward_histories[idx].append(score)
++            current = current.parent
++
++    def _backpropagate_failure(
++        self, state: ExTSState[StateT], node: Node[StateT]
++    ) -> None:
++        current: Optional[Node[StateT]] = node
++        while current is not None:
++            idx = current.expand_idx
++            state.visit_counts[idx] = state.visit_counts.get(idx, 0) + 1
++            current = current.parent
++
++    # -- Helpers ---------------------------------------------------------------
++
++    def _compute_score_quantile(
++        self, state: ExTSState[StateT], quantile: float
++    ) -> Optional[float]:
++        nodes = state.tree.get_nodes()
++        scores = sorted(n.score for n in nodes if not n.is_root() and n.score is not None)
++        if not scores:
++            return None
++        idx = min(int(len(scores) * quantile), len(scores) - 1)
++        return scores[idx]
+diff --git a/tests/test_exts.py b/tests/test_exts.py
+new file mode 100644
+index 0000000..8f9eb97
+--- /dev/null
++++ b/tests/test_exts.py
+@@ -0,0 +1,116 @@
++import random
++from typing import Optional, Tuple
++
++from treequest.algos.exts import ExTS, ExTSState
++
++
++def test_basic_initialization():
++    """ExTS constructs with sensible defaults and an empty root-only state."""
++    algo = ExTS()
++    # PUCT is the default exploration schedule with C = 1.0.
++    assert algo.exploration_type == "puct"
++    assert algo.exploration_constant == 1.0
++
++    # UCT default constant differs.
++    algo_uct = ExTS(exploration_type="uct")
++    assert algo_uct.exploration_constant == 1.414
++
++    state = algo.init_tree()
++    assert isinstance(state, ExTSState)
++    assert state.tree is not None
++    assert state.tree.root is not None
++    assert state.tree.root.is_root()
++    assert len(state.tree.get_state_score_pairs()) == 0
++
++
++def test_single_step():
++    """A single step expands the root once."""
++    def generate_fn(state: Optional[str]) -> Tuple[str, float]:
++        return f"Generated: {random.random()}", 0.5
++
++    algo = ExTS(seed=42)
++    state = algo.init_tree()
++
++    new_state = algo.step(state, {"generate": generate_fn})
++
++    assert len(new_state.tree.get_state_score_pairs()) == 1
++    assert len(new_state.tree.root.children) == 1
++    child = new_state.tree.root.children[0]
++    assert child.parent is new_state.tree.root
++    assert isinstance(child.state, str)
++    assert "Generated" in child.state
++
++
++def test_multiple_steps_grows_tree():
++    """Running several steps produces one new node per step."""
++    def generate_fn(state: Optional[str]) -> Tuple[str, float]:
++        return f"State: {random.random()}", random.uniform(0.1, 1.0)
++
++    algo = ExTS(seed=0)
++    state = algo.init_tree()
++
++    n_steps = 8
++    for _ in range(n_steps):
++        state = algo.step(state, {"generate": generate_fn})
++
++    assert len(state.tree.get_state_score_pairs()) == n_steps
++    # Root should have accumulated visits equal to the number of expansions.
++    assert state.visit_counts.get(-1, 0) == n_steps
++
++
++def test_score_zero_is_failure():
++    """A score of exactly 0.0 is recorded as a failed expansion.
++
++    The node is still added, and visits are incremented along the ancestor
++    chain, but no success is recorded and no reward is stored.
++    """
++    def generate_fn(state: Optional[str]) -> Tuple[str, float]:
++        return "failed", 0.0
++
++    algo = ExTS(seed=1)
++    state = algo.init_tree()
++    state = algo.step(state, {"generate": generate_fn})
++
++    # One node was added.
++    assert len(state.tree.get_state_score_pairs()) == 1
++    child = state.tree.root.children[0]
++
++    # Visits incremented for child and root, but no successes and no rewards.
++    assert state.visit_counts.get(child.expand_idx, 0) == 1
++    assert state.successful_visits.get(child.expand_idx, 0) == 0
++    assert state.reward_histories.get(child.expand_idx, []) == []
++    assert state.visit_counts.get(-1, 0) == 1
++    assert state.successful_visits.get(-1, 0) == 0
++
++
++def test_positive_score_is_success():
++    """A positive score is backpropagated as a success up to the root."""
++    def generate_fn(state: Optional[str]) -> Tuple[str, float]:
++        return "ok", 0.75
++
++    algo = ExTS(seed=2)
++    state = algo.init_tree()
++    state = algo.step(state, {"generate": generate_fn})
++
++    child = state.tree.root.children[0]
++    assert state.successful_visits.get(child.expand_idx, 0) == 1
++    assert state.reward_histories.get(child.expand_idx, []) == [0.75]
++    # Global score bounds updated.
++    assert state.score_min == 0.75
++    assert state.score_max == 0.75
++    # Success propagated to the root as well.
++    assert state.successful_visits.get(-1, 0) == 1
++
++
++def test_stateless_step_does_not_mutate_input():
++    """With inplace=False (default), step returns a new state and leaves the
++    input untouched, matching the stateless Algorithm contract."""
++    def generate_fn(state: Optional[str]) -> Tuple[str, float]:
++        return "x", 0.5
++
++    algo = ExTS(seed=3)
++    state = algo.init_tree()
++    new_state = algo.step(state, {"generate": generate_fn})
++
++    assert len(state.tree.get_state_score_pairs()) == 0
++    assert len(new_state.tree.get_state_score_pairs()) == 1

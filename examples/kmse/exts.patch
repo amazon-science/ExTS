@@ -1,0 +1,910 @@
+diff --git a/k-mse/code/exts.py b/k-mse/code/exts.py
+new file mode 100644
+index 0000000..be70904
+--- /dev/null
++++ b/k-mse/code/exts.py
+@@ -0,0 +1,480 @@
++"""
++ExTS (Exploit More, Explore Smarter for Budget-Constrained Agentic Search): MCTS for validation-heavy search.
++
++Score formula:
++    score(v) = (n_v+ / n_v)^α · mean(φ(norm(r_i))) + exploration(v)
++
++    UCT exploration:  C · √(ln(n_parent) / n_v)
++    PUCT exploration: C · n_parent^p / (1 + n_v)
++
++Each node stores its list of raw reward observations. At selection time,
++each observation is individually min-max normalized using the tree's
++current global [score_min, score_max], shaped through φ, then averaged.
++
++Features:
++- Per-observation exponential temperature shaping with current global range
++- Alpha-controlled success rate scaler
++- Gated expansion (quantile-based)
++- Gated progressive widening
++- Virtual child with bootstrap-style sampled prior
++
++See docs/algorithm.md for the derivation and design rationale, and
++docs/tuning.md for per-dataset hyperparameter guidance.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import random
++from dataclasses import dataclass, field
++from typing import Optional
++
++# ── Defaults ─────────────────────────────────────────────────────────────
++DEFAULT_UCT_EXPLORATION_CONSTANT = 1.414
++DEFAULT_PUCT_EXPLORATION_CONSTANT = 1.0
++DEFAULT_SCORE_TEMPERATURE = 0.3
++DEFAULT_SUCCESS_RATE_ALPHA = 1.414
++DEFAULT_MAX_CHILDREN = 3
++DEFAULT_EXPANSION_GATE_QUANTILE = 0.25
++DEFAULT_USE_GATED_EXPANSION = True
++DEFAULT_USE_PROGRESSIVE_WIDENING = True
++DEFAULT_WIDENING_BASE = 2.0
++DEFAULT_WIDENING_VISIT_THRESHOLD = 32
++DEFAULT_WIDENING_SCORE_QUANTILE = 0.75
++DEFAULT_EXPLORATION_TYPE = "puct"
++DEFAULT_PUCT_PARENT_EXP = 0.5
++
++
++@dataclass
++class ExTSNode:
++    """A node in the ExTS tree."""
++
++    program_idx: int
++    parent: Optional[ExTSNode] = None
++    children: list[ExTSNode] = field(default_factory=list)
++
++    visits: int = 0
++    successful_visits: int = 0
++    reward_history: list[float] = field(default_factory=list)
++
++    # Latest score for gating and progressive widening decisions
++    program_score: Optional[float] = None
++
++    @property
++    def is_leaf(self) -> bool:
++        return len(self.children) == 0
++
++
++class ExTSTree:
++    """ExTS tree for candidate selection in validation-heavy search.
++
++    Parameters:
++        exploration_constant: Exploration weight C. Typical values:
++            UCT:  ~1.414 (√2). Range [0.5, 2.0].
++            PUCT: ~1.0. Range [0.5, 1.5]. Lower than UCT because PUCT
++                  lacks a policy prior P(s,a) that would dampen exploration.
++        score_temperature: Shaping function convexity (lower = sharper).
++        success_rate_alpha: Exponent on (n+/n). 0=ignore failures, 1=linear, >1=amplified.
++        max_children: Base max children per node M_0.
++        expansion_gate_quantile: Quantile threshold for gated expansion.
++        use_gated_expansion: Enable expansion gating.
++        use_progressive_widening: Enable gated progressive widening.
++        widening_base: Log base for progressive widening bonus.
++        widening_visit_threshold: Visits before widening starts.
++        widening_score_quantile: Score quantile gate for PW bonus.
++        exploration_type: "uct" or "puct".
++            UCT:  C · √(ln(n_parent) / n_v)        — logarithmic decay.
++            PUCT: C · n_parent^p / (1 + n_v)       — linear decay, faster convergence.
++        puct_parent_exp: Exponent p on n_parent for PUCT. Default 0.5.
++    """
++
++    def __init__(
++        self,
++        exploration_constant: Optional[float] = None,
++        score_temperature: float = DEFAULT_SCORE_TEMPERATURE,
++        success_rate_alpha: float = DEFAULT_SUCCESS_RATE_ALPHA,
++        max_children: int = DEFAULT_MAX_CHILDREN,
++        expansion_gate_quantile: float = DEFAULT_EXPANSION_GATE_QUANTILE,
++        use_gated_expansion: bool = DEFAULT_USE_GATED_EXPANSION,
++        use_progressive_widening: bool = DEFAULT_USE_PROGRESSIVE_WIDENING,
++        widening_base: float = DEFAULT_WIDENING_BASE,
++        widening_visit_threshold: int = DEFAULT_WIDENING_VISIT_THRESHOLD,
++        widening_score_quantile: float = DEFAULT_WIDENING_SCORE_QUANTILE,
++        exploration_type: str = DEFAULT_EXPLORATION_TYPE,
++        puct_parent_exp: float = DEFAULT_PUCT_PARENT_EXP,
++        rng: Optional[random.Random] = None,
++    ):
++        if exploration_constant is None:
++            if exploration_type == "puct":
++                exploration_constant = DEFAULT_PUCT_EXPLORATION_CONSTANT
++            else:
++                exploration_constant = DEFAULT_UCT_EXPLORATION_CONSTANT
++        self.exploration_constant = exploration_constant
++        self.score_temperature = score_temperature
++        self.success_rate_alpha = success_rate_alpha
++        self.max_children = max_children
++        self.expansion_gate_quantile = expansion_gate_quantile
++        self.use_gated_expansion = use_gated_expansion
++        self.use_progressive_widening = use_progressive_widening
++        self.widening_base = widening_base
++        self.widening_visit_threshold = widening_visit_threshold
++        self.widening_score_quantile = widening_score_quantile
++        self.exploration_type = exploration_type  # "uct" or "puct"
++        self.puct_parent_exp = puct_parent_exp  # exponent on n_parent for PUCT
++        self.rng = rng or random.Random()
++
++        self._nodes: dict[int, ExTSNode] = {}
++        self.root: Optional[ExTSNode] = None
++
++        # Global raw score bounds, updated on each successful backprop
++        self._score_min: float = float("inf")
++        self._score_max: float = float("-inf")
++
++    # ── Shaping ──────────────────────────────────────────────────────────
++
++    def _phi(self, x: float) -> float:
++        """φ(x) = (e^(x/T) - 1) / (e^(1/T) - 1), x ∈ [0, 1]."""
++        T = self.score_temperature
++        if T <= 0:
++            return x
++        exp_inv_T = math.exp(1.0 / T)
++        return (math.exp(x / T) - 1.0) / (exp_inv_T - 1.0)
++
++    def _shaped_mean(self, node: ExTSNode) -> float:
++        """Mean of individually φ-shaped, min-max-normalized rewards."""
++        if not node.reward_history:
++            return 0.0
++        if self._score_max <= self._score_min:
++            return 1.0
++        total = 0.0
++        for r in node.reward_history:
++            x = (r - self._score_min) / (self._score_max - self._score_min)
++            x = max(0.0, min(1.0, x))
++            total += self._phi(x)
++        return total / len(node.reward_history)
++
++    # ── Score helpers ────────────────────────────────────────────────────
++
++    def _compute_score_quantile(self, quantile: float) -> Optional[float]:
++        """Quantile over program_scores of all nodes."""
++        scores = sorted(
++            n.program_score
++            for n in self._nodes.values()
++            if n.program_score is not None
++        )
++        if not scores:
++            return None
++        idx = min(int(len(scores) * quantile), len(scores) - 1)
++        return scores[idx]
++
++    # ── Public API ───────────────────────────────────────────────────────
++
++    def initialize_root(self, program_idx: int, program_score: float) -> None:
++        root = ExTSNode(program_idx=program_idx, program_score=program_score)
++        self._nodes[program_idx] = root
++        self.root = root
++
++    def select(self) -> int:
++        """Select a node for expansion. Returns program_idx."""
++        node = self._uct_select(self.root)
++        return node.program_idx
++
++    def add_child(
++        self,
++        parent_program_idx: int,
++        child_program_idx: int,
++        child_program_score: float,
++    ) -> ExTSNode:
++        parent = self._nodes[parent_program_idx]
++        child = ExTSNode(
++            program_idx=child_program_idx,
++            parent=parent,
++            program_score=child_program_score,
++        )
++        parent.children.append(child)
++        self._nodes[child_program_idx] = child
++        return child
++
++    def backpropagate_success(self, program_idx: int, raw_score: float) -> None:
++        self._score_min = min(self._score_min, raw_score)
++        self._score_max = max(self._score_max, raw_score)
++
++        node = self._nodes[program_idx]
++        while node is not None:
++            node.visits += 1
++            node.successful_visits += 1
++            node.reward_history.append(raw_score)
++            node = node.parent
++
++    def backpropagate_failure(self, program_idx: int) -> None:
++        node = self._nodes[program_idx]
++        while node is not None:
++            node.visits += 1
++            node = node.parent
++
++    def sync_scores(self, per_program_scores: list[float]) -> None:
++        for prog_idx, node in self._nodes.items():
++            if prog_idx < len(per_program_scores):
++                node.program_score = per_program_scores[prog_idx]
++
++    def get_node(self, program_idx: int) -> Optional[ExTSNode]:
++        return self._nodes.get(program_idx)
++
++    # ── UCT scoring ──────────────────────────────────────────────────────
++
++    def _exploration_term(self, parent_visits: int, node_visits: float) -> float:
++        """Compute exploration bonus.
++
++        UCT:  C · √(ln(n_parent) / n_v)
++        PUCT: C · n_parent^p / (1 + n_v)   where p = puct_parent_exp
++        """
++        if self.exploration_type == "puct":
++            return self.exploration_constant * (parent_visits ** self.puct_parent_exp) / (1 + node_visits)
++        return self.exploration_constant * math.sqrt(
++            math.log(parent_visits) / node_visits
++        )
++
++    def _uct_value(self, node: ExTSNode) -> float:
++        if node.visits == 0:
++            return float("inf")
++
++        parent_visits = max(1, node.parent.visits) if node.parent else 1
++
++        if node.successful_visits > 0 and self._score_max > self._score_min:
++            shaped = self._shaped_mean(node)
++            success_rate = node.successful_visits / node.visits
++            exploitation = (success_rate ** self.success_rate_alpha) * shaped
++        elif node.successful_visits > 0:
++            success_rate = node.successful_visits / node.visits
++            exploitation = success_rate ** self.success_rate_alpha
++        else:
++            exploitation = 0.0
++
++        exploration = self._exploration_term(parent_visits, node.visits)
++        return exploitation + exploration
++
++    def _virtual_child_uct(self, node: ExTSNode) -> float:
++        """Virtual child UCT modeling a subtree with n_fair visits.
++
++        Samples k = round(n_fair × success_rate) scores from the parent's
++        reward pool (reward_history + program_score) to estimate what a young
++        subtree would look like. Sampling with replacement preserves
++        bootstrap-style stochasticity at small pool sizes.
++        """
++        parent_visits = max(1, node.visits)
++        m = len(node.children)
++
++        # n_fair = average visit count among existing children, so the virtual
++        # child's UCT is directly comparable to a real child at the same
++        # maturity level (dividing by m rather than m+1 avoids deflating the
++        # baseline and over-biasing toward expansion).
++        children_visits = sum(c.visits for c in node.children)
++        n_fair = max(1, children_visits / m)
++
++        q_prior = 0.0
++        if node.reward_history and self._score_max > self._score_min:
++            success_rate = node.successful_visits / node.visits if node.visits > 0 else 1.0
++            k = max(1, round(n_fair * success_rate))
++
++            # Include program_score in the pool so a child inherits some of the
++            # parent's tracked static quality; its weight is 1/(len(history)+1),
++            # which naturally decays as more rewards accumulate. Sampling is with
++            # replacement to preserve stochasticity when the pool is small.
++            pool = list(node.reward_history)
++            if node.program_score is not None:
++                pool.append(node.program_score)
++
++            samples = self.rng.choices(pool, k=k)
++            total = 0.0
++            for r in samples:
++                x = (r - self._score_min) / (self._score_max - self._score_min)
++                x = max(0.0, min(1.0, x))
++                total += self._phi(x)
++            sampled_mean = total / k
++            q_prior = (success_rate ** self.success_rate_alpha) * sampled_mean
++
++        # Fallback when all scores are identical (_score_max == _score_min):
++        # mirror the real-child exploitation term (success_rate^alpha) so the
++        # virtual vs real comparison stays fair and expansion is not blocked.
++        elif node.successful_visits > 0 and node.visits > 0:
++            success_rate = node.successful_visits / node.visits
++            q_prior = success_rate ** self.success_rate_alpha
++
++        return q_prior + self._exploration_term(parent_visits, n_fair)
++
++    # ── Selection ────────────────────────────────────────────────────────
++
++    def _uct_select(self, node: ExTSNode) -> ExTSNode:
++        if node.is_leaf:
++            return node
++
++        can_expand = self._can_expand(node)
++
++        # Random tiebreaker ensures uniform exploration among equally-scored
++        # children — in particular unvisited children, which all score UCT=inf
++        # and would otherwise be starved in favor of the first-added sibling.
++        best_child = max(node.children, key=lambda c: (self._uct_value(c), self.rng.random()))
++        best_child_uct = self._uct_value(best_child)
++
++        if can_expand:
++            virtual_uct = self._virtual_child_uct(node)
++            if virtual_uct > best_child_uct:
++                return node
++
++        return self._uct_select(best_child)
++
++    def _can_expand(self, node: ExTSNode) -> bool:
++        if len(node.children) >= self._max_children_for_node(node):
++            return False
++
++        if not self.use_gated_expansion or node is self.root:
++            return True
++
++        q_alpha = self._compute_score_quantile(self.expansion_gate_quantile)
++        if q_alpha is None:
++            return True
++
++        if node.program_score is None:
++            return False
++
++        return node.program_score >= q_alpha
++
++    def _max_children_for_node(self, node: ExTSNode) -> int:
++        """M(v) = M_0 + ⌊log_b(n_v / n_0)⌋ · 𝟙[s_v ≥ Q_γ ∨ root]."""
++        if not self.use_progressive_widening:
++            return self.max_children
++
++        n_v = node.visits
++        if n_v < self.widening_visit_threshold:
++            return self.max_children
++
++        bonus = int(
++            math.log(n_v / self.widening_visit_threshold)
++            / math.log(self.widening_base)
++        )
++
++        if node is self.root:
++            return self.max_children + bonus
++
++        q_gamma = self._compute_score_quantile(self.widening_score_quantile)
++        if (
++            q_gamma is not None
++            and node.program_score is not None
++            and node.program_score >= q_gamma
++        ):
++            return self.max_children + bonus
++
++        return self.max_children
++
++    # ── Stats ────────────────────────────────────────────────────────────
++
++    def get_stats(self) -> dict:
++        all_nodes = list(self._nodes.values())
++        return {
++            "total_nodes": len(all_nodes),
++            "total_visits": self.root.visits if self.root else 0,
++            "max_depth": max(
++                (self._node_depth(n) for n in all_nodes), default=0
++            ),
++            "leaf_count": sum(1 for n in all_nodes if n.is_leaf),
++            "score_min": self._score_min if self._score_min != float("inf") else None,
++            "score_max": self._score_max if self._score_max != float("-inf") else None,
++        }
++
++    def _node_depth(self, node: ExTSNode) -> int:
++        depth = 0
++        current = node
++        while current.parent is not None:
++            depth += 1
++            current = current.parent
++        return depth
++
++    # ── Persistence ──────────────────────────────────────────────────────
++
++    def save(self, filepath: str) -> None:
++        tree_data = {
++            "config": {
++                "exploration_constant": self.exploration_constant,
++                "score_temperature": self.score_temperature,
++                "success_rate_alpha": self.success_rate_alpha,
++                "max_children": self.max_children,
++                "expansion_gate_quantile": self.expansion_gate_quantile,
++                "use_gated_expansion": self.use_gated_expansion,
++                "use_progressive_widening": self.use_progressive_widening,
++                "widening_base": self.widening_base,
++                "widening_visit_threshold": self.widening_visit_threshold,
++                "widening_score_quantile": self.widening_score_quantile,
++                "exploration_type": self.exploration_type,
++                "puct_parent_exp": self.puct_parent_exp,
++            },
++            "score_min": self._score_min if self._score_min != float("inf") else None,
++            "score_max": self._score_max if self._score_max != float("-inf") else None,
++            "root_idx": self.root.program_idx if self.root else None,
++            "nodes": {
++                str(prog_idx): {
++                    "program_idx": node.program_idx,
++                    "parent": node.parent.program_idx if node.parent else None,
++                    "children": [c.program_idx for c in node.children],
++                    "visits": node.visits,
++                    "successful_visits": node.successful_visits,
++                    "reward_history": node.reward_history,
++                    "program_score": node.program_score,
++                }
++                for prog_idx, node in self._nodes.items()
++            },
++        }
++        with open(filepath, "w") as f:
++            json.dump(tree_data, f, indent=2)
++
++    @staticmethod
++    def load(filepath: str) -> ExTSTree:
++        with open(filepath) as f:
++            data = json.load(f)
++
++        cfg = data["config"]
++        exploration_type = cfg.get("exploration_type", DEFAULT_EXPLORATION_TYPE)
++        default_c = DEFAULT_PUCT_EXPLORATION_CONSTANT if exploration_type == "puct" else DEFAULT_UCT_EXPLORATION_CONSTANT
++        tree = ExTSTree(
++            exploration_constant=cfg.get("exploration_constant", default_c),
++            score_temperature=cfg.get("score_temperature", DEFAULT_SCORE_TEMPERATURE),
++            success_rate_alpha=cfg.get("success_rate_alpha", DEFAULT_SUCCESS_RATE_ALPHA),
++            max_children=cfg.get("max_children", DEFAULT_MAX_CHILDREN),
++            expansion_gate_quantile=cfg.get("expansion_gate_quantile", DEFAULT_EXPANSION_GATE_QUANTILE),
++            use_gated_expansion=cfg.get("use_gated_expansion", DEFAULT_USE_GATED_EXPANSION),
++            use_progressive_widening=cfg.get("use_progressive_widening", DEFAULT_USE_PROGRESSIVE_WIDENING),
++            widening_base=cfg.get("widening_base", DEFAULT_WIDENING_BASE),
++            widening_visit_threshold=cfg.get("widening_visit_threshold", DEFAULT_WIDENING_VISIT_THRESHOLD),
++            widening_score_quantile=cfg.get("widening_score_quantile", DEFAULT_WIDENING_SCORE_QUANTILE),
++            exploration_type=exploration_type,
++            puct_parent_exp=cfg.get("puct_parent_exp", DEFAULT_PUCT_PARENT_EXP),
++        )
++
++        if data.get("score_min") is not None:
++            tree._score_min = data["score_min"]
++        if data.get("score_max") is not None:
++            tree._score_max = data["score_max"]
++
++        nodes_data = data["nodes"]
++        for key, nd in nodes_data.items():
++            prog_idx = nd["program_idx"]
++            node = ExTSNode(
++                program_idx=prog_idx,
++                visits=nd["visits"],
++                successful_visits=nd["successful_visits"],
++                reward_history=nd["reward_history"],
++                program_score=nd["program_score"],
++            )
++            tree._nodes[prog_idx] = node
++
++        for key, nd in nodes_data.items():
++            prog_idx = nd["program_idx"]
++            node = tree._nodes[prog_idx]
++            if nd["parent"] is not None:
++                node.parent = tree._nodes[nd["parent"]]
++            node.children = [tree._nodes[c] for c in nd["children"]]
++
++        tree.root = (
++            tree._nodes[data["root_idx"]] if data["root_idx"] is not None else None
++        )
++        return tree
+diff --git a/k-mse/code/exts_mcts.py b/k-mse/code/exts_mcts.py
+new file mode 100644
+index 0000000..db4374e
+--- /dev/null
++++ b/k-mse/code/exts_mcts.py
+@@ -0,0 +1,370 @@
++"""
++ExTS candidate-selection variant for K-MSE molecular structure elucidation.
++
++This is the *controller pattern*: an ``ExTSTree`` (from ``exts.py``) owns the
++decision of *which candidate to refine next*, while K-MSE keeps ownership of
++*how to generate* (the zero-shot / critique / refine LLM pipeline) and *how to
++score* (the molecule-spectrum neural scorer). The generation and scoring code
++below is identical to the original ``mcts.MCTSrGPT``; only the tree-search
++policy is swapped.
++
++``MCTSrExTS.run`` mirrors ``mcts.MCTSr.run`` step for step, but replaces the
++MCTS-R UCT importance-sampling selection with ``ExTSTree.select``. Because every
++rollout produces a scored child, only ``backpropagate_success`` is used
++(``backpropagate_failure`` / ``sync_scores`` are unnecessary here).
++"""
++
++from __future__ import annotations
++
++import random
++
++import numpy as np
++import tqdm
++from pydantic import BaseModel, PrivateAttr
++from rdkit import Chem
++from rdkit.Chem import rdMolDescriptors
++
++from agent import Agent, smiles_to_image, encode_image
++from models.encoder import Scorer
++from retriever import Retriever
++from exts import ExTSTree
++
++
++def load_prompt(text_file):
++    with open(text_file, 'r') as f:
++        return f.read()
++
++
++def get_formula(smiles):
++    if smiles == '':
++        return None
++    mol = Chem.MolFromSmiles(smiles)
++    if mol is None:
++        return None
++    return rdMolDescriptors.CalcMolFormula(mol)
++
++
++def print_tree_node(node_data, level=0, output_file=None):
++    indent = " " * level * 2
++    line = (
++        f"ExTSNode(idx={node_data['idx']}, smiles={node_data['smiles']}, "
++        f"score={node_data['score']:.2f}, visits={node_data['visits']}, "
++        f"succ={node_data['successful_visits']})"
++    )
++    if output_file:
++        with open(output_file, 'a') as f:
++            print(indent + line, file=f)
++    else:
++        print(indent + line)
++    for child in node_data.get('children', []):
++        print_tree_node(child, level + 1, output_file)
++
++
++class ExTSCandidateNode(BaseModel):
++    """One K-MSE candidate (a single LLM generation) tracked alongside its
++    integer ``program_idx`` in the ExTS tree."""
++    nid: int = 1
++    program_idx: int = 0
++    question: str
++    full_answer: str
++    reflection_prompt: str = ''
++    reflection: str = ''
++    predict_smiles: str
++    predict_formula: str
++    parent_idx: int | None = None
++    children_idx: list[int] = []
++    score: float = 0.0
++    reward_samples: list[float] = []
++    evaluations: list[str] = []
++
++    def __repr__(self):
++        return (
++            f"ExTSCandidateNode(id={self.nid}, idx={self.program_idx}, "
++            f"smiles={self.predict_smiles}, score={self.score:.2f})"
++        )
++
++    class Config:
++        arbitrary_types_allowed = True
++
++
++class MCTSrExTS(BaseModel):
++    """K-MSE structure elucidation driven by ExTS candidate selection.
++
++    A sibling of ``mcts.MCTSrGPT`` that reuses its exact generation/scoring
++    pipeline while delegating selection and back-propagation to an ``ExTSTree``.
++    """
++
++    cnmr_data: str
++    hnmr_data: str
++    ir_figure: str
++    formula: str
++    agent: Agent
++
++    retriever: Retriever = None
++    retrieval: bool = True
++    retrieve_topk: int = 5
++    substructure_list: list[tuple] = []
++
++    max_rollouts: int
++    total_node: int = 1
++    reward_limit: int = 95
++    excess_reward_penalty: int = 5
++
++    # ExTS hyperparameters
++    max_children: int = 3
++    exploration_constant: float = 1.0
++    score_temperature: float = 0.3
++    exploration_type: str = "puct"
++    use_gated_expansion: bool = True
++    random_seed: int = 0
++
++    all_gen_tokens: str = ''
++
++    # Internal state
++    _tree: ExTSTree | None = PrivateAttr(default=None)
++    _nodes: dict[int, ExTSCandidateNode] = PrivateAttr(default_factory=dict)
++
++    class Config:
++        arbitrary_types_allowed = True
++
++    def _init_tree(self):
++        self._tree = ExTSTree(
++            exploration_constant=self.exploration_constant,
++            score_temperature=self.score_temperature,
++            max_children=self.max_children,
++            exploration_type=self.exploration_type,
++            use_gated_expansion=self.use_gated_expansion,
++            rng=random.Random(self.random_seed),
++        )
++        self._nodes = {}
++
++    def zero_shot(self) -> dict:
++        question_prompt = load_prompt('code/prompts/question.txt')
++        extract_prompt = load_prompt('code/prompts/extract_ans.txt')
++        question_prompt = question_prompt.replace(
++            '<###FORMULA>', self.formula
++        ).replace(
++            '<###CNMR-DATA>', self.cnmr_data
++        ).replace(
++            '<###HNMR-DATA>', self.hnmr_data
++        )
++
++        self.substructure_list = self.retriever.query(
++            self.cnmr_data, self.hnmr_data, self.formula
++        )
++        substructure_prompt = load_prompt('code/prompts/substructure.txt')
++        substructure_prompt = substructure_prompt.replace(
++            '<###LIST>', str(self.substructure_list)
++        )
++        question_prompt = question_prompt + '\n' + substructure_prompt
++
++        while True:
++            analysis = self.agent.run(
++                question_prompt, image=[encode_image(self.ir_figure)]
++            )
++            if 'llama' in self.agent.model_name.lower():
++                predict_smiles = self.agent.run(
++                    extract_prompt.replace('<###INPUT>', analysis)
++                )
++            else:
++                extract_agent = Agent(temperature=0.7, top_p=0.7)
++                predict_smiles = extract_agent.run(
++                    extract_prompt.replace('<###INPUT>', analysis)
++                )
++            pred_formula = get_formula(predict_smiles)
++            if pred_formula is not None:
++                self.all_gen_tokens += analysis
++                break
++
++        return {
++            'question': question_prompt,
++            'full_answer': analysis,
++            'predict_formula': pred_formula,
++            'predict_smiles': predict_smiles,
++        }
++
++    def self_refine(self, parent_node: ExTSCandidateNode) -> ExTSCandidateNode:
++        question_prompt = load_prompt('code/prompts/question.txt')
++        question_prompt = question_prompt.replace(
++            '<###FORMULA>', self.formula
++        ).replace(
++            '<###CNMR-DATA>', self.cnmr_data
++        ).replace(
++            '<###HNMR-DATA>', self.hnmr_data
++        )
++        substructure_prompt = load_prompt('code/prompts/substructure.txt')
++        substructure_prompt = substructure_prompt.replace(
++            '<###LIST>', str(self.substructure_list)
++        )
++        question_prompt = question_prompt + '\n' + substructure_prompt
++
++        critique_prompt = load_prompt('code/prompts/critique.txt')
++        critique_prompt = critique_prompt.replace(
++            '<###PROBLEM>', question_prompt
++        ).replace(
++            '<###ANSWER>', parent_node.full_answer
++        ).replace(
++            '<###SMILES>', parent_node.predict_smiles
++        ).replace(
++            '<###pred-FORMULA>', parent_node.predict_formula
++        )
++        critique_prompt = critique_prompt.replace(
++            "The final output of the SMILES of the molecule is required to end with 'The SMILES of the molecule is'.",
++            ''
++        )
++        critique = self.agent.run(
++            critique_prompt,
++            image=[encode_image(self.ir_figure), smiles_to_image(parent_node.predict_smiles)]
++        )
++
++        refine_prompt = load_prompt('code/prompts/refine.txt')
++        refine_prompt = refine_prompt.replace(
++            '<###PROBLEM>', question_prompt
++        ).replace(
++            '<###ANSWER>', parent_node.full_answer
++        ).replace(
++            '<###SMILES>', parent_node.predict_smiles
++        ).replace(
++            '<###pred-FORMULA>', parent_node.predict_formula
++        ).replace(
++            '<###CRITIQUE>', critique
++        )
++
++        extract_prompt = load_prompt('code/prompts/extract_ans.txt')
++        substructure_prompt = load_prompt('code/prompts/substructure.txt')
++        substructure_prompt = substructure_prompt.replace(
++            '<###LIST>', str(self.substructure_list)
++        )
++        refine_prompt = refine_prompt + '\n\n' + substructure_prompt
++
++        while True:
++            analysis = self.agent.run(
++                refine_prompt, image=[encode_image(self.ir_figure)]
++            )
++            if 'llama' in self.agent.model_name.lower():
++                predict_smiles = self.agent.run(
++                    extract_prompt.replace('<###INPUT>', analysis)
++                )
++            else:
++                extract_agent = Agent(temperature=0.7, top_p=0.7)
++                predict_smiles = extract_agent.run(
++                    extract_prompt.replace('<###INPUT>', analysis)
++                )
++            pred_formula = get_formula(predict_smiles)
++            if pred_formula is not None:
++                self.all_gen_tokens += critique + analysis
++                break
++
++        self.total_node += 1
++        child_node = ExTSCandidateNode(
++            nid=self.total_node,
++            program_idx=self.total_node - 1,
++            question=refine_prompt,
++            full_answer=analysis,
++            reflection_prompt=critique_prompt,
++            reflection=critique,
++            predict_smiles=predict_smiles,
++            predict_formula=pred_formula,
++            parent_idx=parent_node.program_idx,
++        )
++        return child_node
++
++    def _evaluate(self, node: ExTSCandidateNode, scorer: Scorer) -> float:
++        score = scorer.calc_score(node.predict_smiles, self.cnmr_data, self.hnmr_data)
++        raw_score = float(score * 100)
++        if raw_score > self.reward_limit:
++            raw_score -= self.excess_reward_penalty
++        node.score = raw_score
++        node.reward_samples.append(raw_score)
++        return raw_score
++
++    def run(self, scorer: Scorer) -> str:
++        self._init_tree()
++
++        # Root: original zero-shot generation, scored and seeded into the tree.
++        root_data = self.zero_shot()
++        root_node = ExTSCandidateNode(
++            nid=1,
++            program_idx=0,
++            question=root_data['question'],
++            full_answer=root_data['full_answer'],
++            predict_smiles=root_data['predict_smiles'],
++            predict_formula=root_data['predict_formula'],
++        )
++        root_score = self._evaluate(root_node, scorer)
++        self._nodes[0] = root_node
++        self._tree.initialize_root(program_idx=0, program_score=root_score)
++        self._tree.backpropagate_success(program_idx=0, raw_score=root_score)
++
++        for _ in tqdm.tqdm(range(self.max_rollouts)):
++            # 1. ExTS selects which candidate to refine next.
++            selected_idx = self._tree.select()
++            parent_node = self._nodes[selected_idx]
++
++            # 2. Original K-MSE critique + refine produces a child.
++            child_node = self.self_refine(parent_node)
++            child_idx = child_node.program_idx
++
++            # 3. Original scorer evaluates it.
++            child_score = self._evaluate(child_node, scorer)
++
++            # 4. Attach + back-propagate into the ExTS tree.
++            self._tree.add_child(
++                parent_program_idx=selected_idx,
++                child_program_idx=child_idx,
++                child_program_score=child_score,
++            )
++            self._tree.backpropagate_success(
++                program_idx=child_idx, raw_score=child_score
++            )
++
++            self._nodes[child_idx] = child_node
++            parent_node.children_idx.append(child_idx)
++
++        return self._get_best_answer()
++
++    def _get_best_answer(self) -> str:
++        best_node = max(self._nodes.values(), key=lambda n: np.mean(n.reward_samples))
++        return best_node.predict_smiles
++
++    def print(self, output_file=None):
++        if output_file is not None:
++            import os
++            if os.path.exists(output_file):
++                os.remove(output_file)
++
++        def _build_tree_data(idx):
++            node = self._nodes[idx]
++            tree_node = self._tree.get_node(idx)
++            return {
++                'idx': idx,
++                'smiles': node.predict_smiles,
++                'score': node.score,
++                'visits': tree_node.visits if tree_node else 0,
++                'successful_visits': tree_node.successful_visits if tree_node else 0,
++                'children': [_build_tree_data(c) for c in node.children_idx],
++            }
++
++        root_data = _build_tree_data(0)
++        print_tree_node(root_data, output_file=output_file)
++
++    def print_detail(self, output_dir):
++        for idx, node in self._nodes.items():
++            with open(output_dir + f'/{node.nid}.txt', 'w') as f:
++                f.write('reflection_prompt##################################################################\n')
++                f.write(node.reflection_prompt)
++                f.write('\n\n\n')
++                f.write('reflection##################################################################\n')
++                f.write(node.reflection)
++                f.write('\n\n\n')
++                f.write('question##################################################################\n')
++                f.write(node.question)
++                f.write('\n\n\n')
++                f.write('full_answer##################################################################\n')
++                f.write(node.full_answer)
++                f.write('\n\n\n')
++                f.write('evaluation##################################################################\n')
++                for evaluation in node.evaluations:
++                    f.write(evaluation)
++                    f.write('\n\n\n')
++                    f.write('##################################################################\n')
+diff --git a/k-mse/code/run.py b/k-mse/code/run.py
+index c03a91e..b408ecf 100644
+--- a/k-mse/code/run.py
++++ b/k-mse/code/run.py
+@@ -56,6 +56,17 @@ def parser_args():
+     parser.add_argument('--scorer_path', default='code/models/ckpt.pth', type=str)
+     parser.add_argument('--kb_path', default='data/kb.json', type=str)
+ 
++    # Selection policy: 'original' = MCTS-R UCT importance sampling (default),
++    # 'exts' = ExTS candidate-selection tree (see exts_mcts.MCTSrExTS).
++    parser.add_argument('--mcts_variant', default='original', choices=['original', 'exts'])
++
++    # ExTS hyperparameters (only used when --mcts_variant exts).
++    parser.add_argument('--exts_max_children', default=3, type=int)
++    parser.add_argument('--exts_exploration_constant', default=1.0, type=float)
++    parser.add_argument('--exts_score_temperature', default=0.3, type=float)
++    parser.add_argument('--exts_exploration_type', default='puct', choices=['uct', 'puct'])
++    parser.add_argument('--exts_no_gated_expansion', action='store_true')
++
+     parser.add_argument('--debug', action='store_true')
+     return parser.parse_args()
+ 
+@@ -91,7 +102,24 @@ class Runner:
+             ir_figure = data['IR_figure']
+ 
+ 
+-            mcts_runner = MCTSrGPT(cnmr_data=cnmr_data,
++            if self.args.mcts_variant == 'exts':
++                from exts_mcts import MCTSrExTS
++                mcts_runner = MCTSrExTS(cnmr_data=cnmr_data,
++                                hnmr_data=hnmr_data,
++                                ir_figure=ir_figure,
++                                formula=formula,
++                                agent=self.agent,
++                                max_rollouts=self.args.max_rollouts,
++                                retriever=self.retriever,
++                                retrieve_topk=self.args.retrieve_topk,
++                                max_children=self.args.exts_max_children,
++                                exploration_constant=self.args.exts_exploration_constant,
++                                score_temperature=self.args.exts_score_temperature,
++                                exploration_type=self.args.exts_exploration_type,
++                                use_gated_expansion=not self.args.exts_no_gated_expansion,
++                                random_seed=self.args.random_seed)
++            else:
++                mcts_runner = MCTSrGPT(cnmr_data=cnmr_data,
+                                 hnmr_data=hnmr_data,
+                                 ir_figure=ir_figure,
+                                 formula=formula,

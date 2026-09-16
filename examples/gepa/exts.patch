@@ -1,0 +1,718 @@
+diff --git a/gepa_artifact/gepa/exts.py b/gepa_artifact/gepa/exts.py
+new file mode 100644
+index 0000000..be70904
+--- /dev/null
++++ b/gepa_artifact/gepa/exts.py
+@@ -0,0 +1,480 @@
++"""
++ExTS (Exploit More, Explore Smarter for Budget-Constrained Agentic Search): MCTS for validation-heavy search.
++
++Score formula:
++    score(v) = (n_v+ / n_v)^α · mean(φ(norm(r_i))) + exploration(v)
++
++    UCT exploration:  C · √(ln(n_parent) / n_v)
++    PUCT exploration: C · n_parent^p / (1 + n_v)
++
++Each node stores its list of raw reward observations. At selection time,
++each observation is individually min-max normalized using the tree's
++current global [score_min, score_max], shaped through φ, then averaged.
++
++Features:
++- Per-observation exponential temperature shaping with current global range
++- Alpha-controlled success rate scaler
++- Gated expansion (quantile-based)
++- Gated progressive widening
++- Virtual child with bootstrap-style sampled prior
++
++See docs/algorithm.md for the derivation and design rationale, and
++docs/tuning.md for per-dataset hyperparameter guidance.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import random
++from dataclasses import dataclass, field
++from typing import Optional
++
++# ── Defaults ─────────────────────────────────────────────────────────────
++DEFAULT_UCT_EXPLORATION_CONSTANT = 1.414
++DEFAULT_PUCT_EXPLORATION_CONSTANT = 1.0
++DEFAULT_SCORE_TEMPERATURE = 0.3
++DEFAULT_SUCCESS_RATE_ALPHA = 1.414
++DEFAULT_MAX_CHILDREN = 3
++DEFAULT_EXPANSION_GATE_QUANTILE = 0.25
++DEFAULT_USE_GATED_EXPANSION = True
++DEFAULT_USE_PROGRESSIVE_WIDENING = True
++DEFAULT_WIDENING_BASE = 2.0
++DEFAULT_WIDENING_VISIT_THRESHOLD = 32
++DEFAULT_WIDENING_SCORE_QUANTILE = 0.75
++DEFAULT_EXPLORATION_TYPE = "puct"
++DEFAULT_PUCT_PARENT_EXP = 0.5
++
++
++@dataclass
++class ExTSNode:
++    """A node in the ExTS tree."""
++
++    program_idx: int
++    parent: Optional[ExTSNode] = None
++    children: list[ExTSNode] = field(default_factory=list)
++
++    visits: int = 0
++    successful_visits: int = 0
++    reward_history: list[float] = field(default_factory=list)
++
++    # Latest score for gating and progressive widening decisions
++    program_score: Optional[float] = None
++
++    @property
++    def is_leaf(self) -> bool:
++        return len(self.children) == 0
++
++
++class ExTSTree:
++    """ExTS tree for candidate selection in validation-heavy search.
++
++    Parameters:
++        exploration_constant: Exploration weight C. Typical values:
++            UCT:  ~1.414 (√2). Range [0.5, 2.0].
++            PUCT: ~1.0. Range [0.5, 1.5]. Lower than UCT because PUCT
++                  lacks a policy prior P(s,a) that would dampen exploration.
++        score_temperature: Shaping function convexity (lower = sharper).
++        success_rate_alpha: Exponent on (n+/n). 0=ignore failures, 1=linear, >1=amplified.
++        max_children: Base max children per node M_0.
++        expansion_gate_quantile: Quantile threshold for gated expansion.
++        use_gated_expansion: Enable expansion gating.
++        use_progressive_widening: Enable gated progressive widening.
++        widening_base: Log base for progressive widening bonus.
++        widening_visit_threshold: Visits before widening starts.
++        widening_score_quantile: Score quantile gate for PW bonus.
++        exploration_type: "uct" or "puct".
++            UCT:  C · √(ln(n_parent) / n_v)        — logarithmic decay.
++            PUCT: C · n_parent^p / (1 + n_v)       — linear decay, faster convergence.
++        puct_parent_exp: Exponent p on n_parent for PUCT. Default 0.5.
++    """
++
++    def __init__(
++        self,
++        exploration_constant: Optional[float] = None,
++        score_temperature: float = DEFAULT_SCORE_TEMPERATURE,
++        success_rate_alpha: float = DEFAULT_SUCCESS_RATE_ALPHA,
++        max_children: int = DEFAULT_MAX_CHILDREN,
++        expansion_gate_quantile: float = DEFAULT_EXPANSION_GATE_QUANTILE,
++        use_gated_expansion: bool = DEFAULT_USE_GATED_EXPANSION,
++        use_progressive_widening: bool = DEFAULT_USE_PROGRESSIVE_WIDENING,
++        widening_base: float = DEFAULT_WIDENING_BASE,
++        widening_visit_threshold: int = DEFAULT_WIDENING_VISIT_THRESHOLD,
++        widening_score_quantile: float = DEFAULT_WIDENING_SCORE_QUANTILE,
++        exploration_type: str = DEFAULT_EXPLORATION_TYPE,
++        puct_parent_exp: float = DEFAULT_PUCT_PARENT_EXP,
++        rng: Optional[random.Random] = None,
++    ):
++        if exploration_constant is None:
++            if exploration_type == "puct":
++                exploration_constant = DEFAULT_PUCT_EXPLORATION_CONSTANT
++            else:
++                exploration_constant = DEFAULT_UCT_EXPLORATION_CONSTANT
++        self.exploration_constant = exploration_constant
++        self.score_temperature = score_temperature
++        self.success_rate_alpha = success_rate_alpha
++        self.max_children = max_children
++        self.expansion_gate_quantile = expansion_gate_quantile
++        self.use_gated_expansion = use_gated_expansion
++        self.use_progressive_widening = use_progressive_widening
++        self.widening_base = widening_base
++        self.widening_visit_threshold = widening_visit_threshold
++        self.widening_score_quantile = widening_score_quantile
++        self.exploration_type = exploration_type  # "uct" or "puct"
++        self.puct_parent_exp = puct_parent_exp  # exponent on n_parent for PUCT
++        self.rng = rng or random.Random()
++
++        self._nodes: dict[int, ExTSNode] = {}
++        self.root: Optional[ExTSNode] = None
++
++        # Global raw score bounds, updated on each successful backprop
++        self._score_min: float = float("inf")
++        self._score_max: float = float("-inf")
++
++    # ── Shaping ──────────────────────────────────────────────────────────
++
++    def _phi(self, x: float) -> float:
++        """φ(x) = (e^(x/T) - 1) / (e^(1/T) - 1), x ∈ [0, 1]."""
++        T = self.score_temperature
++        if T <= 0:
++            return x
++        exp_inv_T = math.exp(1.0 / T)
++        return (math.exp(x / T) - 1.0) / (exp_inv_T - 1.0)
++
++    def _shaped_mean(self, node: ExTSNode) -> float:
++        """Mean of individually φ-shaped, min-max-normalized rewards."""
++        if not node.reward_history:
++            return 0.0
++        if self._score_max <= self._score_min:
++            return 1.0
++        total = 0.0
++        for r in node.reward_history:
++            x = (r - self._score_min) / (self._score_max - self._score_min)
++            x = max(0.0, min(1.0, x))
++            total += self._phi(x)
++        return total / len(node.reward_history)
++
++    # ── Score helpers ────────────────────────────────────────────────────
++
++    def _compute_score_quantile(self, quantile: float) -> Optional[float]:
++        """Quantile over program_scores of all nodes."""
++        scores = sorted(
++            n.program_score
++            for n in self._nodes.values()
++            if n.program_score is not None
++        )
++        if not scores:
++            return None
++        idx = min(int(len(scores) * quantile), len(scores) - 1)
++        return scores[idx]
++
++    # ── Public API ───────────────────────────────────────────────────────
++
++    def initialize_root(self, program_idx: int, program_score: float) -> None:
++        root = ExTSNode(program_idx=program_idx, program_score=program_score)
++        self._nodes[program_idx] = root
++        self.root = root
++
++    def select(self) -> int:
++        """Select a node for expansion. Returns program_idx."""
++        node = self._uct_select(self.root)
++        return node.program_idx
++
++    def add_child(
++        self,
++        parent_program_idx: int,
++        child_program_idx: int,
++        child_program_score: float,
++    ) -> ExTSNode:
++        parent = self._nodes[parent_program_idx]
++        child = ExTSNode(
++            program_idx=child_program_idx,
++            parent=parent,
++            program_score=child_program_score,
++        )
++        parent.children.append(child)
++        self._nodes[child_program_idx] = child
++        return child
++
++    def backpropagate_success(self, program_idx: int, raw_score: float) -> None:
++        self._score_min = min(self._score_min, raw_score)
++        self._score_max = max(self._score_max, raw_score)
++
++        node = self._nodes[program_idx]
++        while node is not None:
++            node.visits += 1
++            node.successful_visits += 1
++            node.reward_history.append(raw_score)
++            node = node.parent
++
++    def backpropagate_failure(self, program_idx: int) -> None:
++        node = self._nodes[program_idx]
++        while node is not None:
++            node.visits += 1
++            node = node.parent
++
++    def sync_scores(self, per_program_scores: list[float]) -> None:
++        for prog_idx, node in self._nodes.items():
++            if prog_idx < len(per_program_scores):
++                node.program_score = per_program_scores[prog_idx]
++
++    def get_node(self, program_idx: int) -> Optional[ExTSNode]:
++        return self._nodes.get(program_idx)
++
++    # ── UCT scoring ──────────────────────────────────────────────────────
++
++    def _exploration_term(self, parent_visits: int, node_visits: float) -> float:
++        """Compute exploration bonus.
++
++        UCT:  C · √(ln(n_parent) / n_v)
++        PUCT: C · n_parent^p / (1 + n_v)   where p = puct_parent_exp
++        """
++        if self.exploration_type == "puct":
++            return self.exploration_constant * (parent_visits ** self.puct_parent_exp) / (1 + node_visits)
++        return self.exploration_constant * math.sqrt(
++            math.log(parent_visits) / node_visits
++        )
++
++    def _uct_value(self, node: ExTSNode) -> float:
++        if node.visits == 0:
++            return float("inf")
++
++        parent_visits = max(1, node.parent.visits) if node.parent else 1
++
++        if node.successful_visits > 0 and self._score_max > self._score_min:
++            shaped = self._shaped_mean(node)
++            success_rate = node.successful_visits / node.visits
++            exploitation = (success_rate ** self.success_rate_alpha) * shaped
++        elif node.successful_visits > 0:
++            success_rate = node.successful_visits / node.visits
++            exploitation = success_rate ** self.success_rate_alpha
++        else:
++            exploitation = 0.0
++
++        exploration = self._exploration_term(parent_visits, node.visits)
++        return exploitation + exploration
++
++    def _virtual_child_uct(self, node: ExTSNode) -> float:
++        """Virtual child UCT modeling a subtree with n_fair visits.
++
++        Samples k = round(n_fair × success_rate) scores from the parent's
++        reward pool (reward_history + program_score) to estimate what a young
++        subtree would look like. Sampling with replacement preserves
++        bootstrap-style stochasticity at small pool sizes.
++        """
++        parent_visits = max(1, node.visits)
++        m = len(node.children)
++
++        # n_fair = average visit count among existing children, so the virtual
++        # child's UCT is directly comparable to a real child at the same
++        # maturity level (dividing by m rather than m+1 avoids deflating the
++        # baseline and over-biasing toward expansion).
++        children_visits = sum(c.visits for c in node.children)
++        n_fair = max(1, children_visits / m)
++
++        q_prior = 0.0
++        if node.reward_history and self._score_max > self._score_min:
++            success_rate = node.successful_visits / node.visits if node.visits > 0 else 1.0
++            k = max(1, round(n_fair * success_rate))
++
++            # Include program_score in the pool so a child inherits some of the
++            # parent's tracked static quality; its weight is 1/(len(history)+1),
++            # which naturally decays as more rewards accumulate. Sampling is with
++            # replacement to preserve stochasticity when the pool is small.
++            pool = list(node.reward_history)
++            if node.program_score is not None:
++                pool.append(node.program_score)
++
++            samples = self.rng.choices(pool, k=k)
++            total = 0.0
++            for r in samples:
++                x = (r - self._score_min) / (self._score_max - self._score_min)
++                x = max(0.0, min(1.0, x))
++                total += self._phi(x)
++            sampled_mean = total / k
++            q_prior = (success_rate ** self.success_rate_alpha) * sampled_mean
++
++        # Fallback when all scores are identical (_score_max == _score_min):
++        # mirror the real-child exploitation term (success_rate^alpha) so the
++        # virtual vs real comparison stays fair and expansion is not blocked.
++        elif node.successful_visits > 0 and node.visits > 0:
++            success_rate = node.successful_visits / node.visits
++            q_prior = success_rate ** self.success_rate_alpha
++
++        return q_prior + self._exploration_term(parent_visits, n_fair)
++
++    # ── Selection ────────────────────────────────────────────────────────
++
++    def _uct_select(self, node: ExTSNode) -> ExTSNode:
++        if node.is_leaf:
++            return node
++
++        can_expand = self._can_expand(node)
++
++        # Random tiebreaker ensures uniform exploration among equally-scored
++        # children — in particular unvisited children, which all score UCT=inf
++        # and would otherwise be starved in favor of the first-added sibling.
++        best_child = max(node.children, key=lambda c: (self._uct_value(c), self.rng.random()))
++        best_child_uct = self._uct_value(best_child)
++
++        if can_expand:
++            virtual_uct = self._virtual_child_uct(node)
++            if virtual_uct > best_child_uct:
++                return node
++
++        return self._uct_select(best_child)
++
++    def _can_expand(self, node: ExTSNode) -> bool:
++        if len(node.children) >= self._max_children_for_node(node):
++            return False
++
++        if not self.use_gated_expansion or node is self.root:
++            return True
++
++        q_alpha = self._compute_score_quantile(self.expansion_gate_quantile)
++        if q_alpha is None:
++            return True
++
++        if node.program_score is None:
++            return False
++
++        return node.program_score >= q_alpha
++
++    def _max_children_for_node(self, node: ExTSNode) -> int:
++        """M(v) = M_0 + ⌊log_b(n_v / n_0)⌋ · 𝟙[s_v ≥ Q_γ ∨ root]."""
++        if not self.use_progressive_widening:
++            return self.max_children
++
++        n_v = node.visits
++        if n_v < self.widening_visit_threshold:
++            return self.max_children
++
++        bonus = int(
++            math.log(n_v / self.widening_visit_threshold)
++            / math.log(self.widening_base)
++        )
++
++        if node is self.root:
++            return self.max_children + bonus
++
++        q_gamma = self._compute_score_quantile(self.widening_score_quantile)
++        if (
++            q_gamma is not None
++            and node.program_score is not None
++            and node.program_score >= q_gamma
++        ):
++            return self.max_children + bonus
++
++        return self.max_children
++
++    # ── Stats ────────────────────────────────────────────────────────────
++
++    def get_stats(self) -> dict:
++        all_nodes = list(self._nodes.values())
++        return {
++            "total_nodes": len(all_nodes),
++            "total_visits": self.root.visits if self.root else 0,
++            "max_depth": max(
++                (self._node_depth(n) for n in all_nodes), default=0
++            ),
++            "leaf_count": sum(1 for n in all_nodes if n.is_leaf),
++            "score_min": self._score_min if self._score_min != float("inf") else None,
++            "score_max": self._score_max if self._score_max != float("-inf") else None,
++        }
++
++    def _node_depth(self, node: ExTSNode) -> int:
++        depth = 0
++        current = node
++        while current.parent is not None:
++            depth += 1
++            current = current.parent
++        return depth
++
++    # ── Persistence ──────────────────────────────────────────────────────
++
++    def save(self, filepath: str) -> None:
++        tree_data = {
++            "config": {
++                "exploration_constant": self.exploration_constant,
++                "score_temperature": self.score_temperature,
++                "success_rate_alpha": self.success_rate_alpha,
++                "max_children": self.max_children,
++                "expansion_gate_quantile": self.expansion_gate_quantile,
++                "use_gated_expansion": self.use_gated_expansion,
++                "use_progressive_widening": self.use_progressive_widening,
++                "widening_base": self.widening_base,
++                "widening_visit_threshold": self.widening_visit_threshold,
++                "widening_score_quantile": self.widening_score_quantile,
++                "exploration_type": self.exploration_type,
++                "puct_parent_exp": self.puct_parent_exp,
++            },
++            "score_min": self._score_min if self._score_min != float("inf") else None,
++            "score_max": self._score_max if self._score_max != float("-inf") else None,
++            "root_idx": self.root.program_idx if self.root else None,
++            "nodes": {
++                str(prog_idx): {
++                    "program_idx": node.program_idx,
++                    "parent": node.parent.program_idx if node.parent else None,
++                    "children": [c.program_idx for c in node.children],
++                    "visits": node.visits,
++                    "successful_visits": node.successful_visits,
++                    "reward_history": node.reward_history,
++                    "program_score": node.program_score,
++                }
++                for prog_idx, node in self._nodes.items()
++            },
++        }
++        with open(filepath, "w") as f:
++            json.dump(tree_data, f, indent=2)
++
++    @staticmethod
++    def load(filepath: str) -> ExTSTree:
++        with open(filepath) as f:
++            data = json.load(f)
++
++        cfg = data["config"]
++        exploration_type = cfg.get("exploration_type", DEFAULT_EXPLORATION_TYPE)
++        default_c = DEFAULT_PUCT_EXPLORATION_CONSTANT if exploration_type == "puct" else DEFAULT_UCT_EXPLORATION_CONSTANT
++        tree = ExTSTree(
++            exploration_constant=cfg.get("exploration_constant", default_c),
++            score_temperature=cfg.get("score_temperature", DEFAULT_SCORE_TEMPERATURE),
++            success_rate_alpha=cfg.get("success_rate_alpha", DEFAULT_SUCCESS_RATE_ALPHA),
++            max_children=cfg.get("max_children", DEFAULT_MAX_CHILDREN),
++            expansion_gate_quantile=cfg.get("expansion_gate_quantile", DEFAULT_EXPANSION_GATE_QUANTILE),
++            use_gated_expansion=cfg.get("use_gated_expansion", DEFAULT_USE_GATED_EXPANSION),
++            use_progressive_widening=cfg.get("use_progressive_widening", DEFAULT_USE_PROGRESSIVE_WIDENING),
++            widening_base=cfg.get("widening_base", DEFAULT_WIDENING_BASE),
++            widening_visit_threshold=cfg.get("widening_visit_threshold", DEFAULT_WIDENING_VISIT_THRESHOLD),
++            widening_score_quantile=cfg.get("widening_score_quantile", DEFAULT_WIDENING_SCORE_QUANTILE),
++            exploration_type=exploration_type,
++            puct_parent_exp=cfg.get("puct_parent_exp", DEFAULT_PUCT_PARENT_EXP),
++        )
++
++        if data.get("score_min") is not None:
++            tree._score_min = data["score_min"]
++        if data.get("score_max") is not None:
++            tree._score_max = data["score_max"]
++
++        nodes_data = data["nodes"]
++        for key, nd in nodes_data.items():
++            prog_idx = nd["program_idx"]
++            node = ExTSNode(
++                program_idx=prog_idx,
++                visits=nd["visits"],
++                successful_visits=nd["successful_visits"],
++                reward_history=nd["reward_history"],
++                program_score=nd["program_score"],
++            )
++            tree._nodes[prog_idx] = node
++
++        for key, nd in nodes_data.items():
++            prog_idx = nd["program_idx"]
++            node = tree._nodes[prog_idx]
++            if nd["parent"] is not None:
++                node.parent = tree._nodes[nd["parent"]]
++            node.children = [tree._nodes[c] for c in nd["children"]]
++
++        tree.root = (
++            tree._nodes[data["root_idx"]] if data["root_idx"] is not None else None
++        )
++        return tree
+diff --git a/gepa_artifact/gepa/gepa.py b/gepa_artifact/gepa/gepa.py
+index 47a61d6..50c5e93 100644
+--- a/gepa_artifact/gepa/gepa.py
++++ b/gepa_artifact/gepa/gepa.py
+@@ -4,7 +4,7 @@ import math
+ import os
+ import random
+ import traceback
+-from typing import Literal, Union
++from typing import Literal, Optional, Union
+ import dspy
+ import json
+ 
+@@ -32,6 +32,43 @@ from .merge_programs import (
+     sample_and_attempt_merge_programs_by_common_predictors
+ )
+ 
++# ── ExTS (Exploit More, Explore Smarter for Budget-Constrained Agentic Search) integration ──
++# ExTS attaches to GEPA as a pluggable candidate-selection controller. The tree
++# exposes a small duck-typed interface (initialize_root / select / add_child /
++# backpropagate_success / backpropagate_failure / sync_scores / save) that GEPA
++# calls at fixed hook points below. See gepa/exts.py for the algorithm.
++from .exts import ExTSTree
++
++
++def rebuild_exts_tree_from_gepa_state(tree: ExTSTree, gepa_state) -> None:
++    """Rebuild an ExTS tree from an existing GEPAState (e.g. checkpoint resume).
++
++    Reconnects every previously discovered program to its parent and seeds one
++    successful visit per node so selection has a warm prior after resuming.
++    """
++    for prog_idx in range(1, len(gepa_state.program_candidates)):
++        parents = gepa_state.parent_program_for_candidate[prog_idx]
++        parent_idx = parents[0] if parents[0] is not None else 0
++        if parent_idx not in tree._nodes:
++            continue
++        score = gepa_state.per_program_tracked_scores[prog_idx]
++        tree.add_child(
++            parent_program_idx=parent_idx,
++            child_program_idx=prog_idx,
++            child_program_score=score,
++        )
++        node = tree.get_node(prog_idx)
++        node.visits = 1
++        node.successful_visits = 1
++        node.reward_history.append(score)
++        tree._score_min = min(tree._score_min, score)
++        tree._score_max = max(tree._score_max, score)
++
++    if tree.root:
++        tree.root.visits = len(gepa_state.program_candidates)
++        tree.root.successful_visits = len(gepa_state.program_candidates)
++
++
+ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+     def __init__(
+         self,
+@@ -58,6 +95,8 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+         set_for_merge_minibatch='train',  # 'train', 'val', or 'both'
+         track_scores_on: Literal['val', 'train_val'] = 'train_val',
+         add_format_failure_as_feedback: bool=False,
++        candidate_selection_strategy: Literal['pareto', 'greedy', 'exts'] = 'pareto',
++        exts_kwargs: Optional[dict] = None,
+     ):
+         # Exactly one of max_metric_calls, max_evals_per_trainval_instance or num_iters should be set
+         assert (max_metric_calls is not None) + (max_evals_per_trainval_instance is not None) + (num_iters is not None) == 1, "Exactly one of max_metric_calls, max_evals_per_trainval_instance or num_iters should be set. You set max_metric_calls={}, max_evals_per_trainval_instance={}, num_iters={}".format(
+@@ -100,7 +139,17 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+         self.num_dspy_examples_per_gepa_step = num_dspy_examples_per_gepa_step
+ 
+         self.add_format_failure_as_feedback = add_format_failure_as_feedback
+-        
++
++        # Candidate selection strategy: 'pareto', 'greedy', or 'exts'.
++        # Backward compat: run_linearized_gepa=True implies 'greedy' unless the
++        # caller explicitly picks another strategy. This preserves the original
++        # default behavior (greedy/idxmax when linearized, Pareto otherwise).
++        if run_linearized_gepa and candidate_selection_strategy == 'pareto':
++            self.candidate_selection_strategy = 'greedy'
++        else:
++            self.candidate_selection_strategy = candidate_selection_strategy
++        self.exts_kwargs = exts_kwargs or {}
++
+         self.shuffled_trainset_ids = []
+         self.epoch = -1
+         self.id_freqs = Counter()
+@@ -207,18 +256,21 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+             ] # TODO: Think about whether this should be added or not. Make this configurable.
+         ) if self.track_scores_on == 'train_val' else gepa_state.program_at_pareto_front_valset
+     
+-    def select_next_candidate_to_update(self, gepa_state: GEPAState):
++    def select_next_candidate_to_update(self, gepa_state: GEPAState, exts_tree=None):
+         # TODO: Update this method to use pareto front from both train and val sets configurable
+         assert len(gepa_state.per_program_tracked_scores) == len(gepa_state.program_candidates)
+ 
+-        if not gepa_state.running_linearized_gepa:
++        if self.candidate_selection_strategy == 'exts':
++            assert exts_tree is not None, "ExTS tree must be provided when using ExTS selection"
++            curr_prog_id = exts_tree.select()
++        elif self.candidate_selection_strategy == 'greedy':
++            curr_prog_id = idxmax(gepa_state.per_program_tracked_scores)
++        else:  # 'pareto'
+             curr_prog_id = select_program_candidate_from_pareto_front(
+-                self.get_pareto_front_programs(gepa_state), 
++                self.get_pareto_front_programs(gepa_state),
+                 gepa_state.per_program_tracked_scores,
+                 gepa_state.rng1,
+             )
+-        else:
+-            curr_prog_id = idxmax(gepa_state.per_program_tracked_scores)
+ 
+         return curr_prog_id
+     
+@@ -356,6 +408,20 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+             self.logger.log(f"Iteration {gepa_state.i+1}: Base program full trainset score: {gepa_state.program_full_scores[0]}")
+         self.logger.log(f"Iteration {gepa_state.i+1}: Base program full valset score: {gepa_state.program_full_scores_val_set[0]}")
+ 
++        # Initialize the ExTS controller tree if using ExTS selection.
++        exts_tree = None
++        if self.candidate_selection_strategy == 'exts':
++            exts_tree = ExTSTree(
++                rng=gepa_state.rng2,
++                **self.exts_kwargs,
++            )
++            exts_tree.initialize_root(
++                program_idx=0,
++                program_score=gepa_state.per_program_tracked_scores[0],
++            )
++            if len(gepa_state.program_candidates) > 1:
++                rebuild_exts_tree_from_gepa_state(exts_tree, gepa_state)
++
+         merges_due = 0
+         total_merges_tested = 0
+ 
+@@ -371,6 +437,8 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+             assert gepa_state.is_consistent(), "GEPA state is inconsistent, please check the implementation"
+             try:
+                 gepa_state.save(self.run_dir)
++                if exts_tree is not None:
++                    exts_tree.save(os.path.join(self.run_dir, "exts_tree.json"))
+                 gepa_state.i += 1
+                 gepa_state.full_program_trace.append({"i": gepa_state.i})
+ 
+@@ -470,13 +538,24 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+                             valset_evaluator=valset_evaluator,
+                             parent_program_idx=[id1, id2]
+                         )
++
++                        if exts_tree is not None:
++                            merge_parent = id1 if gepa_state.per_program_tracked_scores[id1] >= gepa_state.per_program_tracked_scores[id2] else id2
++                            if exts_tree.get_node(merge_parent) is not None:
++                                exts_tree.add_child(
++                                    parent_program_idx=merge_parent,
++                                    child_program_idx=new_program_idx,
++                                    child_program_score=gepa_state.per_program_tracked_scores[new_program_idx],
++                                )
++                                exts_tree.sync_scores(gepa_state.per_program_tracked_scores)
++
+                         continue
+                     else:
+                         self.logger.log(f"Iteration {gepa_state.i+1}: No merge candidates found")
+                 
+                 last_iter_found_new_program = False
+ 
+-                curr_prog_id = self.select_next_candidate_to_update(gepa_state)
++                curr_prog_id = self.select_next_candidate_to_update(gepa_state, exts_tree=exts_tree)
+                 curr_prog = gepa_state.program_candidates[curr_prog_id]
+ 
+                 gepa_state.full_program_trace[-1]['selected_program_candidate'] = curr_prog_id
+@@ -487,6 +566,8 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+                 predictor_name_to_update = gepa_state.list_of_named_predictors[predictor_to_update_id]
+                 if predictor_name_to_update not in self.named_predictor_to_feedback_fn_map:
+                     self.logger.log(f"Iteration {gepa_state.i+1}: Predictor {predictor_name_to_update} not in feedback map, skipping")
++                    if exts_tree is not None:
++                        exts_tree.backpropagate_failure(curr_prog_id)
+                     continue
+ 
+                 self.logger.log(f"Iteration {gepa_state.i+1}: Selected program candidate {curr_prog_id} with base score: {gepa_state.per_program_tracked_scores[curr_prog_id]}")
+@@ -530,6 +611,8 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+ 
+                 if dataset_with_feedback is None or subsample_score is None:
+                     self.logger.log(f"Iteration {gepa_state.i+1}: No feedback samples, skipping")
++                    if exts_tree is not None:
++                        exts_tree.backpropagate_failure(curr_prog_id)
+                     continue
+ 
+                 if self.use_wandb:
+@@ -554,7 +637,8 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+                 except Exception as e:
+                     self.logger.log(f"Iteration {gepa_state.i+1}: Exception during instruction proposal: {e}")
+                     self.logger.log(traceback.format_exc())
+-
++                    if exts_tree is not None:
++                        exts_tree.backpropagate_failure(curr_prog_id)
+                     continue
+                 self.logger.log(f"Iteration {gepa_state.i+1}: Info retrieved from knowledge base: {kb_info}")
+                 self.logger.log(f"Iteration {gepa_state.i+1}: Proposed new instruction: {new_instruction}")
+@@ -590,6 +674,8 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+                 
+                 if new_subsample_score <= subsample_score:
+                     self.logger.log(f"Iteration {gepa_state.i+1}: New subsample score is not better, skipping")
++                    if exts_tree is not None:
++                        exts_tree.backpropagate_failure(curr_prog_id)
+                     continue
+ 
+                 last_iter_found_new_program = True
+@@ -604,6 +690,18 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+                     parent_program_idx=[curr_prog_id]
+                 )
+ 
++                if exts_tree is not None:
++                    exts_tree.add_child(
++                        parent_program_idx=curr_prog_id,
++                        child_program_idx=new_program_idx,
++                        child_program_score=gepa_state.per_program_tracked_scores[new_program_idx],
++                    )
++                    exts_tree.backpropagate_success(
++                        curr_prog_id,
++                        gepa_state.per_program_tracked_scores[new_program_idx],
++                    )
++                    exts_tree.sync_scores(gepa_state.per_program_tracked_scores)
++
+                 if self.use_merge and total_merges_tested < self.max_merge_invocations:
+                     merges_due += 1
+ 
+@@ -613,5 +711,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
+                 continue
+         
+         gepa_state.save(self.run_dir)
++        if exts_tree is not None:
++            exts_tree.save(os.path.join(self.run_dir, "exts_tree.json"))
+ 
+         return gepa_state

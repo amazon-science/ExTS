@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# Example scaffolding: cloned upstreams and any fetched data / run artifacts
+examples/*/upstream/
+examples/**/data/
+examples/**/results/
+examples/**/outputs/
+examples/**/*.log
+
+# Local agent / harness config (not part of the release)
+.claude/
+
+# Editor / OS
+.DS_Store
+._*
+.idea/
+.vscode/
+
+# Saved ExTS trees produced by runs
+*.tree.json
+mcts_tree.json
+
+# ExTS HotpotQA multi-hop benchmark: local venvs, ColBERT diskcache, torch ext cache
+examples/**/.colbert_probe_venv/
+examples/**/.runner_venv/
+examples/**/hotpotqa_multihop/colbert_cache/
+examples/gepa/gepa-artifact/
+examples/treequest/treequest/
